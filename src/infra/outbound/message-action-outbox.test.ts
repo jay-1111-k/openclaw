@@ -20,6 +20,10 @@ function resolveOutboxPath(root: string): string {
   return path.join(root, "outbound", "message-action-outbox.json");
 }
 
+function resolveOutboxLockPath(root: string): string {
+  return path.join(root, "outbound", "message-action-outbox.json.lock");
+}
+
 async function readOutbox(root: string) {
   const raw = await fs.readFile(resolveOutboxPath(root), "utf8");
   return JSON.parse(raw) as { entriesById: Record<string, unknown> };
@@ -58,7 +62,7 @@ describe("message-action outbox", () => {
     expect(leased).toHaveLength(1);
     expect(leased[0]?.id).toBe(id);
 
-    await markMessageActionOutboxDone(id);
+    await markMessageActionOutboxDone(id, { leaseToken: leased[0]?.leaseToken });
 
     const followUp = await leaseMessageActionOutbox({
       limit: 1,
@@ -85,7 +89,10 @@ describe("message-action outbox", () => {
     });
     expect(leased).toHaveLength(1);
 
-    await markMessageActionOutboxFailed(id, new Error("nope"), { now: 1_000 });
+    await markMessageActionOutboxFailed(id, new Error("nope"), {
+      now: 1_000,
+      leaseToken: leased[0]?.leaseToken,
+    });
 
     const retryTooSoon = await leaseMessageActionOutbox({
       limit: 1,
@@ -126,5 +133,24 @@ describe("message-action outbox", () => {
     });
     expect(reLeased).toHaveLength(1);
     expect(reLeased[0]?.leaseOwner).toBe("worker-b");
+  });
+
+  it("waits for the outbox lock to clear", async () => {
+    const lockPath = resolveOutboxLockPath(stateDir);
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({ pid: process.pid, createdAt: Date.now() }),
+      "utf8",
+    );
+
+    const enqueuePromise = enqueueMessageActionOutbox(payload);
+    await vi.advanceTimersByTimeAsync(100);
+    await fs.unlink(lockPath);
+    await vi.advanceTimersByTimeAsync(200);
+
+    const { id } = await enqueuePromise;
+    const state = await readOutbox(stateDir);
+    expect(state.entriesById[id]).toBeDefined();
   });
 });
