@@ -43,6 +43,10 @@ import { resolveChannelTarget, type ResolvedMessagingTarget } from "./target-res
 import { loadWebMedia } from "../../web/media.js";
 import { extensionForMime } from "../../media/mime.js";
 import { parseSlackTarget } from "../../slack/targets.js";
+import {
+  enqueueMessageActionOutbox,
+  type OutboxMessageActionPayloadV1,
+} from "./message-action-outbox.js";
 
 export type MessageActionRunnerGateway = {
   url?: string;
@@ -1042,4 +1046,20 @@ export async function runMessageAction(
     input,
     abortSignal: input.abortSignal,
   });
+}
+
+export async function enqueueMessageAction(
+  params: RunMessageActionParams,
+): Promise<{ id: string }> {
+  const payload: OutboxMessageActionPayloadV1 = {
+    action: params.action,
+    params: params.params,
+    defaultAccountId: params.defaultAccountId,
+    toolContext: params.toolContext,
+    gateway: params.gateway,
+    sessionKey: params.sessionKey,
+    agentId: params.agentId,
+    dryRun: params.dryRun,
+  };
+  return enqueueMessageActionOutbox(payload);
 }
