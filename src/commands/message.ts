@@ -6,7 +6,7 @@ import { createOutboundSendDeps, type CliDeps } from "../cli/outbound-send-deps.
 import { withProgress } from "../cli/progress.js";
 import { loadConfig } from "../config/config.js";
 import type { OutboundSendDeps } from "../infra/outbound/deliver.js";
-import { runMessageAction } from "../infra/outbound/message-action-runner.js";
+import { enqueueMessageAction, runMessageAction } from "../infra/outbound/message-action-runner.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { buildMessageCliJson, formatMessageCliText } from "./message-format.js";
@@ -29,8 +29,28 @@ export async function messageCommand(
 
   const outboundDeps: OutboundSendDeps = createOutboundSendDeps(deps);
 
-  const run = async () =>
-    await runMessageAction({
+  const useOutbox =
+    process.env.WORKER_OUTBOX_ENABLED === "1" || process.env.WORKER_OUTBOX_ENABLED === "true";
+  const run = async () => {
+    if (useOutbox) {
+      const queued = await enqueueMessageAction({
+        cfg,
+        action,
+        params: opts,
+        deps: outboundDeps,
+        gateway: {
+          clientName: GATEWAY_CLIENT_NAMES.CLI,
+          mode: GATEWAY_CLIENT_MODES.CLI,
+        },
+      });
+      if (opts.json === true) {
+        runtime.log(JSON.stringify({ queued: true, id: queued.id }, null, 2));
+      } else {
+        runtime.log(`Queued message action (${queued.id}).`);
+      }
+      return null;
+    }
+    return await runMessageAction({
       cfg,
       action,
       params: opts,
@@ -40,10 +60,11 @@ export async function messageCommand(
         mode: GATEWAY_CLIENT_MODES.CLI,
       },
     });
+  };
 
   const json = opts.json === true;
   const dryRun = opts.dryRun === true;
-  const needsSpinner = !json && !dryRun && (action === "send" || action === "poll");
+  const needsSpinner = !json && !dryRun && (action === "send" || action === "poll") && !useOutbox;
 
   const result = needsSpinner
     ? await withProgress(
@@ -55,6 +76,10 @@ export async function messageCommand(
         run,
       )
     : await run();
+
+  if (!result) {
+    return;
+  }
 
   if (json) {
     runtime.log(JSON.stringify(buildMessageCliJson(result), null, 2));
