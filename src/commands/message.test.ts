@@ -240,6 +240,47 @@ describe("messageCommand", () => {
     expect(callGatewayMock).toHaveBeenCalled();
   });
 
+  it("executes immediately when outbox is disabled", async () => {
+    delete process.env.WORKER_OUTBOX_ENABLED;
+    const runMessageAction = vi.fn().mockResolvedValue({
+      kind: "send",
+      action: "send",
+      channel: "telegram",
+      to: "telegram:123",
+      handledBy: "core",
+      payload: {},
+      dryRun: false,
+    });
+    const enqueueMessageAction = vi.fn();
+
+    vi.doMock("../infra/outbound/message-action-runner.js", async (importOriginal) => {
+      const actual =
+        await importOriginal<typeof import("../infra/outbound/message-action-runner.js")>();
+      return {
+        ...actual,
+        runMessageAction,
+        enqueueMessageAction,
+      };
+    });
+
+    const { messageCommand } = await import("./message.js");
+    await messageCommand(
+      {
+        action: "send",
+        target: "telegram:123",
+        message: "hi",
+        json: true,
+      },
+      makeDeps(),
+      runtime,
+    );
+
+    expect(runMessageAction).toHaveBeenCalled();
+    expect(enqueueMessageAction).not.toHaveBeenCalled();
+    vi.unmock("../infra/outbound/message-action-runner.js");
+    vi.resetModules();
+  });
+
   it("routes discord polls through message action", async () => {
     await setRegistry(
       createTestRegistry([

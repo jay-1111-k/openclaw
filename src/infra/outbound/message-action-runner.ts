@@ -1051,6 +1051,7 @@ export async function runMessageAction(
 export async function enqueueMessageAction(
   params: RunMessageActionParams,
 ): Promise<{ id: string }> {
+  const cfgSnapshot = buildOutboxConfigSnapshot(params.cfg);
   const payload: OutboxMessageActionPayloadV1 = {
     action: params.action,
     params: params.params,
@@ -1060,6 +1061,33 @@ export async function enqueueMessageAction(
     sessionKey: params.sessionKey,
     agentId: params.agentId,
     dryRun: params.dryRun,
+    cfgSnapshot,
   };
   return enqueueMessageActionOutbox(payload);
+}
+
+const OUTBOX_SENSITIVE_KEY_PATTERN = /token|password|secret|api.?key/i;
+
+function buildOutboxConfigSnapshot(cfg: OpenClawConfig): OpenClawConfig {
+  // Snapshot non-secret config so queued actions execute deterministically. Sensitive keys
+  // are removed and merged from runtime config at execution time.
+  return redactOutboxConfig(cfg) as OpenClawConfig;
+}
+
+function redactOutboxConfig(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactOutboxConfig(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const redacted: Record<string, unknown> = {};
+  for (const [key, entryValue] of Object.entries(record)) {
+    if (OUTBOX_SENSITIVE_KEY_PATTERN.test(key)) {
+      continue;
+    }
+    redacted[key] = redactOutboxConfig(entryValue);
+  }
+  return redacted;
 }

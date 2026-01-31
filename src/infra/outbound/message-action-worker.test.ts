@@ -123,4 +123,92 @@ describe("message-action outbox worker", () => {
     expect(entry?.attempts).toBe(1);
     expect(entry?.availableAt).toBe(2_000);
   });
+
+  it("keeps leases alive during long-running actions", async () => {
+    vi.setSystemTime(1_000);
+    await enqueueMessageActionOutbox(payload);
+
+    const controllerA = new AbortController();
+    const controllerB = new AbortController();
+
+    mocks.runMessageAction.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            controllerA.abort();
+            controllerB.abort();
+            resolve({
+              kind: "send",
+              action: "send",
+              channel: "telegram",
+              to: "telegram:123",
+              handledBy: "plugin",
+              payload: {},
+              dryRun: false,
+            } satisfies MessageActionRunResult);
+          }, 200);
+        }),
+    );
+
+    const workerA = runMessageActionOutboxWorker({
+      cfg: {} as OpenClawConfig,
+      workerId: "worker-a",
+      stopSignal: controllerA.signal,
+      pollIntervalMs: 10,
+      leaseMs: 50,
+      limit: 1,
+    });
+    const workerB = runMessageActionOutboxWorker({
+      cfg: {} as OpenClawConfig,
+      workerId: "worker-b",
+      stopSignal: controllerB.signal,
+      pollIntervalMs: 10,
+      leaseMs: 50,
+      limit: 1,
+    });
+
+    await vi.advanceTimersByTimeAsync(250);
+    await Promise.all([workerA, workerB]);
+
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses cfg snapshot for queued actions and merges secrets from runtime", async () => {
+    vi.setSystemTime(1_000);
+    await enqueueMessageActionOutbox({
+      ...payload,
+      cfgSnapshot: {
+        channels: { telegram: { dmPolicy: "open" } },
+      } as OpenClawConfig,
+    });
+
+    const controller = new AbortController();
+    mocks.runMessageAction.mockImplementationOnce(async ({ cfg }) => {
+      controller.abort();
+      expect((cfg as OpenClawConfig).channels?.telegram?.dmPolicy).toBe("open");
+      expect((cfg as OpenClawConfig).channels?.telegram?.token).toBe("secret");
+      return {
+        kind: "send",
+        action: "send",
+        channel: "telegram",
+        to: "telegram:123",
+        handledBy: "plugin",
+        payload: {},
+        dryRun: false,
+      } satisfies MessageActionRunResult;
+    });
+
+    await runMessageActionOutboxWorker({
+      cfg: {
+        channels: { telegram: { dmPolicy: "closed", token: "secret" } },
+      } as OpenClawConfig,
+      workerId: "worker-a",
+      stopSignal: controller.signal,
+      pollIntervalMs: 5,
+      leaseMs: 5_000,
+      limit: 1,
+    });
+
+    expect(mocks.runMessageAction).toHaveBeenCalledTimes(1);
+  });
 });

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import type { OpenClawConfig } from "../../config/config.js";
 import { resolveStateDir } from "../../config/paths.js";
 import type {
   ChannelMessageActionName,
@@ -18,6 +19,7 @@ export type OutboxMessageActionPayloadV1 = {
   sessionKey?: string;
   agentId?: string;
   dryRun?: boolean;
+  cfgSnapshot?: OpenClawConfig;
 };
 
 export type MessageActionOutboxEntry = {
@@ -26,6 +28,7 @@ export type MessageActionOutboxEntry = {
   attempts: number;
   availableAt: number;
   leaseOwner?: string;
+  leaseToken?: string;
   leaseUntil?: number;
   createdAt: number;
   updatedAt: number;
@@ -40,6 +43,10 @@ type MessageActionOutboxState = {
 const DEFAULT_MAX_ATTEMPTS = 10;
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
+const LOCK_STALE_MS = 30_000;
+const LOCK_RETRY_LIMIT = 24;
+const LOCK_RETRY_BASE_MS = 25;
+const LOCK_RETRY_MAX_MS = 500;
 
 function resolveOutboxPath(baseDir?: string) {
   const root = baseDir ?? resolveStateDir();
@@ -47,6 +54,7 @@ function resolveOutboxPath(baseDir?: string) {
   return {
     dir,
     outboxPath: path.join(dir, "message-action-outbox.json"),
+    lockPath: path.join(dir, "message-action-outbox.json.lock"),
   };
 }
 
@@ -85,11 +93,93 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
     release = resolve;
   });
   await prev;
+  const { lockPath } = resolveOutboxPath();
+  let acquired = false;
   try {
+    await acquireOutboxLock(lockPath);
+    acquired = true;
     return await fn();
   } finally {
+    if (acquired) {
+      await releaseOutboxLock(lockPath);
+    }
     release?.();
   }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ESRCH") {
+      return false;
+    }
+    return true;
+  }
+}
+
+async function readLockInfo(
+  lockPath: string,
+): Promise<{ pid?: number; createdAt?: number } | null> {
+  try {
+    const raw = await fs.readFile(lockPath, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number; createdAt?: number };
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function isLockStale(lockPath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(lockPath);
+    const now = Date.now();
+    if (now - stat.mtimeMs > LOCK_STALE_MS) {
+      return true;
+    }
+    const info = await readLockInfo(lockPath);
+    if (info?.pid && !isProcessAlive(info.pid)) {
+      return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+async function acquireOutboxLock(lockPath: string): Promise<void> {
+  for (let attempt = 0; attempt < LOCK_RETRY_LIMIT; attempt += 1) {
+    try {
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+      const handle = await fs.open(lockPath, "wx");
+      try {
+        await handle.writeFile(
+          JSON.stringify({ pid: process.pid, createdAt: Date.now() }, null, 2),
+          "utf8",
+        );
+      } finally {
+        await handle.close();
+      }
+      return;
+    } catch (err) {
+      if (!(err instanceof Error) || !("code" in err) || err.code !== "EEXIST") {
+        throw err;
+      }
+      if (await isLockStale(lockPath)) {
+        await fs.unlink(lockPath).catch(() => undefined);
+        continue;
+      }
+      const backoff = Math.min(LOCK_RETRY_MAX_MS, LOCK_RETRY_BASE_MS * 2 ** attempt);
+      const jitter = Math.floor(Math.random() * LOCK_RETRY_BASE_MS);
+      await new Promise((resolve) => setTimeout(resolve, backoff + jitter));
+    }
+  }
+  throw new Error("Timed out acquiring message action outbox lock.");
+}
+
+async function releaseOutboxLock(lockPath: string): Promise<void> {
+  await fs.unlink(lockPath).catch(() => undefined);
 }
 
 async function loadState(baseDir?: string): Promise<MessageActionOutboxState> {
@@ -176,6 +266,7 @@ export async function leaseMessageActionOutbox(opts: {
     for (const entry of eligible) {
       entry.status = "leased";
       entry.leaseOwner = opts.workerId;
+      entry.leaseToken = randomUUID();
       entry.leaseUntil = now + opts.leaseMs;
       entry.updatedAt = now;
       state.entriesById[entry.id] = entry;
@@ -186,17 +277,48 @@ export async function leaseMessageActionOutbox(opts: {
   });
 }
 
-export async function markMessageActionOutboxDone(id: string): Promise<void> {
+export async function extendMessageActionOutboxLease(opts: {
+  id: string;
+  leaseToken: string;
+  leaseMs: number;
+  now?: number;
+}): Promise<boolean> {
+  return await withLock(async () => {
+    const state = await loadState();
+    const entry = state.entriesById[opts.id];
+    if (!entry || entry.status !== "leased") {
+      return false;
+    }
+    if (entry.leaseToken !== opts.leaseToken) {
+      return false;
+    }
+    const now = opts.now ?? Date.now();
+    entry.leaseUntil = now + opts.leaseMs;
+    entry.updatedAt = now;
+    state.entriesById[entry.id] = entry;
+    await persistState(state);
+    return true;
+  });
+}
+
+export async function markMessageActionOutboxDone(
+  id: string,
+  opts?: { leaseToken?: string; now?: number },
+): Promise<void> {
   return await withLock(async () => {
     const state = await loadState();
     const entry = state.entriesById[id];
     if (!entry) {
       return;
     }
-    const now = Date.now();
+    if (entry.leaseToken && entry.leaseToken !== opts?.leaseToken) {
+      return;
+    }
+    const now = opts?.now ?? Date.now();
     entry.status = "done";
     entry.updatedAt = now;
     entry.leaseOwner = undefined;
+    entry.leaseToken = undefined;
     entry.leaseUntil = undefined;
     entry.lastError = undefined;
     state.entriesById[id] = entry;
@@ -207,12 +329,15 @@ export async function markMessageActionOutboxDone(id: string): Promise<void> {
 export async function markMessageActionOutboxFailed(
   id: string,
   err: unknown,
-  opts?: { now?: number; maxAttempts?: number },
+  opts?: { now?: number; maxAttempts?: number; leaseToken?: string },
 ): Promise<void> {
   return await withLock(async () => {
     const state = await loadState();
     const entry = state.entriesById[id];
     if (!entry) {
+      return;
+    }
+    if (entry.leaseToken && entry.leaseToken !== opts?.leaseToken) {
       return;
     }
     const now = opts?.now ?? Date.now();
@@ -221,6 +346,7 @@ export async function markMessageActionOutboxFailed(
     entry.attempts = attempts;
     entry.lastError = formatError(err);
     entry.leaseOwner = undefined;
+    entry.leaseToken = undefined;
     entry.leaseUntil = undefined;
     if (attempts >= maxAttempts) {
       entry.status = "dead";
